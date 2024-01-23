@@ -1,8 +1,10 @@
 import {
+  ApiPath,
   DEFAULT_API_HOST,
   DEFAULT_MODELS,
   OpenaiPath,
   REQUEST_TIMEOUT_MS,
+  ServiceProvider,
 } from "@/app/constant";
 import { useAccessStore, useAppConfig, useChatStore } from "@/app/store";
 
@@ -21,6 +23,8 @@ import {
 } from "@fortaine/fetch-event-source";
 import { prettyObject } from "@/app/utils/format";
 import { getClientConfig } from "@/app/config/client";
+import { makeAzurePath } from "@/app/azure";
+import axios from "axios";
 
 export interface OpenAIListModelResponse {
   object: string;
@@ -34,21 +38,37 @@ export interface OpenAIListModelResponse {
 export class ChatGPTApi implements LLMApi {
   private disableListModels = true;
 
-  path(path: string): string {
-    let openaiUrl = useAccessStore.getState().openaiUrl;
-    const apiPath = "/api/openai";
+  path(path: string, model?: string): string {
+    const accessStore = useAccessStore.getState();
 
-    if (openaiUrl.length === 0) {
+    const isAzure = accessStore.provider === ServiceProvider.Azure;
+
+    if (isAzure && !accessStore.isValidAzure()) {
+      throw Error(
+        "incomplete azure config, please check it in your settings page",
+      );
+    }
+
+    let baseUrl = isAzure ? accessStore.azureUrl : accessStore.openaiUrl;
+
+    if (baseUrl.length === 0) {
       const isApp = !!getClientConfig()?.isApp;
-      openaiUrl = isApp ? DEFAULT_API_HOST : apiPath;
+      baseUrl = isApp ? DEFAULT_API_HOST : ApiPath.OpenAI;
     }
-    if (openaiUrl.endsWith("/")) {
-      openaiUrl = openaiUrl.slice(0, openaiUrl.length - 1);
+
+    if (baseUrl.endsWith("/")) {
+      baseUrl = baseUrl.slice(0, baseUrl.length - 1);
     }
-    if (!openaiUrl.startsWith("http") && !openaiUrl.startsWith(apiPath)) {
-      openaiUrl = "https://" + openaiUrl;
+    if (!baseUrl.startsWith("http") && !baseUrl.startsWith(ApiPath.OpenAI)) {
+      baseUrl = "https://" + baseUrl;
     }
-    return [openaiUrl, path].join("/");
+
+    if (isAzure) {
+      path = makeAzurePath(path, accessStore.azureApiVersion);
+      return [baseUrl, model, path].join("/");
+    }
+
+    return [baseUrl, path].join("/");
   }
 
   extractMessage(res: any) {
@@ -56,10 +76,49 @@ export class ChatGPTApi implements LLMApi {
   }
 
   async chat(options: ChatOptions) {
-    const messages = options.messages.map((v) => ({
-      role: v.role,
-      content: v.content,
-    }));
+    const messages: any[] = [];
+
+    const getImageBase64Data = async (url: string) => {
+      const response = await axios.get(url, { responseType: "arraybuffer" });
+      const base64 = Buffer.from(response.data, "binary").toString("base64");
+      return base64;
+    };
+    if (options.config.model === "gpt-4-vision-preview") {
+      for (const v of options.messages) {
+        let message: {
+          role: string;
+          content: {
+            type: string;
+            text?: string;
+            image_url?: { url: string };
+          }[];
+        } = {
+          role: v.role,
+          content: [],
+        };
+        message.content.push({
+          type: "text",
+          text: v.content,
+        });
+        if (v.image_url) {
+          var base64Data = await getImageBase64Data(v.image_url);
+          message.content.push({
+            type: "image_url",
+            image_url: {
+              url: `data:image/jpeg;base64,${base64Data}`,
+            },
+          });
+        }
+        messages.push(message);
+      }
+    } else {
+      options.messages.map((v) =>
+        messages.push({
+          role: v.role,
+          content: v.content,
+        }),
+      );
+    }
 
     const modelConfig = {
       ...useAppConfig.getState().modelConfig,
@@ -68,7 +127,6 @@ export class ChatGPTApi implements LLMApi {
         model: options.config.model,
       },
     };
-
     const requestPayload = {
       messages,
       stream: options.config.stream,
@@ -77,6 +135,10 @@ export class ChatGPTApi implements LLMApi {
       presence_penalty: modelConfig.presence_penalty,
       frequency_penalty: modelConfig.frequency_penalty,
       top_p: modelConfig.top_p,
+      max_tokens:
+        modelConfig.model == "gpt-4-vision-preview"
+          ? modelConfig.max_tokens
+          : null,
       // max_tokens: Math.max(modelConfig.max_tokens, 1024),
       // Please do not ask me why not send max_tokens, no reason, this param is just shit, I dont want to explain anymore.
     };
@@ -88,7 +150,7 @@ export class ChatGPTApi implements LLMApi {
     options.onController?.(controller);
 
     try {
-      const chatPath = this.path(OpenaiPath.ChatPath);
+      const chatPath = this.path(OpenaiPath.ChatPath, modelConfig.model);
       const chatPayload = {
         method: "POST",
         body: JSON.stringify(requestPayload),
@@ -104,17 +166,39 @@ export class ChatGPTApi implements LLMApi {
 
       if (shouldStream) {
         let responseText = "";
+        let remainText = "";
         let finished = false;
+
+        // animate response to make it looks smooth
+        function animateResponseText() {
+          if (finished || controller.signal.aborted) {
+            responseText += remainText;
+            console.log("[Response Animation] finished");
+            return;
+          }
+
+          if (remainText.length > 0) {
+            const fetchCount = Math.max(1, Math.round(remainText.length / 60));
+            const fetchText = remainText.slice(0, fetchCount);
+            responseText += fetchText;
+            remainText = remainText.slice(fetchCount);
+            options.onUpdate?.(responseText, fetchText);
+          }
+
+          requestAnimationFrame(animateResponseText);
+        }
+
+        // start animaion
+        animateResponseText();
 
         const finish = () => {
           if (!finished) {
-            options.onFinish(responseText);
             finished = true;
+            options.onFinish(responseText + remainText);
           }
         };
 
         controller.signal.onabort = finish;
-
         fetchEventSource(chatPath, {
           ...chatPayload,
           async onopen(res) {
@@ -163,14 +247,19 @@ export class ChatGPTApi implements LLMApi {
             }
             const text = msg.data;
             try {
-              const json = JSON.parse(text);
-              const delta = json.choices[0]?.delta.content;
+              const json = JSON.parse(text) as {
+                choices: Array<{
+                  delta: {
+                    content: string;
+                  };
+                }>;
+              };
+              const delta = json.choices[0]?.delta?.content;
               if (delta) {
-                responseText += delta;
-                options.onUpdate?.(responseText, delta);
+                remainText += delta;
               }
             } catch (e) {
-              console.error("[Request] parse error", text, msg);
+              console.error("[Request] parse error", text);
             }
           },
           onclose() {
@@ -209,16 +298,20 @@ export class ChatGPTApi implements LLMApi {
         model: options.config.model,
       },
     };
-
+    const accessStore = useAccessStore.getState();
+    const isAzure = accessStore.provider === ServiceProvider.Azure;
+    let baseUrl = isAzure ? accessStore.azureUrl : accessStore.openaiUrl;
     const requestPayload = {
       messages,
+      isAzure,
+      azureApiVersion: accessStore.azureApiVersion,
       stream: options.config.stream,
       model: modelConfig.model,
       temperature: modelConfig.temperature,
       presence_penalty: modelConfig.presence_penalty,
       frequency_penalty: modelConfig.frequency_penalty,
       top_p: modelConfig.top_p,
-      baseUrl: useAccessStore.getState().openaiUrl,
+      baseUrl: baseUrl,
       maxIterations: options.agentConfig.maxIterations,
       returnIntermediateSteps: options.agentConfig.returnIntermediateSteps,
       useTools: options.agentConfig.useTools,
@@ -231,7 +324,9 @@ export class ChatGPTApi implements LLMApi {
     options.onController?.(controller);
 
     try {
-      const path = "/api/langchain/tool/agent";
+      let path = "/api/langchain/tool/agent/";
+      const enableNodeJSPlugin = !!process.env.NEXT_PUBLIC_ENABLE_NODEJS_PLUGIN;
+      path = enableNodeJSPlugin ? path + "nodejs" : path + "edge";
       const chatPayload = {
         method: "POST",
         body: JSON.stringify(requestPayload),
@@ -244,7 +339,7 @@ export class ChatGPTApi implements LLMApi {
         () => controller.abort(),
         REQUEST_TIMEOUT_MS,
       );
-      console.log("shouldStream", shouldStream);
+      // console.log("shouldStream", shouldStream);
 
       if (shouldStream) {
         let responseText = "";
@@ -435,6 +530,11 @@ export class ChatGPTApi implements LLMApi {
     return chatModels.map((m) => ({
       name: m.id,
       available: true,
+      provider: {
+        id: "openai",
+        providerName: "OpenAI",
+        providerType: "openai",
+      },
     }));
   }
 }
